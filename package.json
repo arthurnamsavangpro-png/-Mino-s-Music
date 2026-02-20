@@ -1,16 +1,5 @@
 {
-  "name": "[+] Mino's Music",
-  "version": "1.0.0",
-  "type": "commonjs",
-  "main": "index.js",
   "scripts": {
-    "start": "node index.js"
-  },
-  "dependencies": {
-    "discord.js": "^14.0.0",
-    "pg": "^8.11.0"
-  },
-  "engines": {
-    "node": ">=18"
+    "start": "node src/index.js"
   }
 }
