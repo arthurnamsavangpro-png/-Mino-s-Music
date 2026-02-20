@@ -244,7 +244,7 @@ class MusicManager {
     if (!session?.player) throw new Error("Aucun player actif.");
 
     session.volume = Math.max(0, Math.min(100, volume));
-    await session.player.setGlobalVolume(session.volume * 10);
+    await session.player.setGlobalVolume(session.volume);
     await this.renderController(guildId);
   }
 
