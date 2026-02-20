@@ -1,17 +1,17 @@
 {
   "name": "minos-music",
   "version": "1.0.0",
-  "description": "Discord bot deployed on Railway",
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
     "start": "node index.js"
   },
   "engines": {
-    "node": ">=18.20.0"
+    "node": ">=18.0.0"
   },
   "dependencies": {
-    "discord.js": "^14.17.0",
-    "dotenv": "^16.4.5"
+    "discord.js": "^14.21.0",
+    "dotenv": "^16.4.5",
+    "shoukaku": "^4.1.1"
   }
 }
