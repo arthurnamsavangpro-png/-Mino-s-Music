@@ -57,7 +57,7 @@ class MusicManager {
     this.sessions.set(guild.id, session);
 
     // Shoukaku global volume is 0-1000
-    await player.setGlobalVolume(session.volume * 10);
+    await player.setGlobalVolume(session.volume);
 
     this.bindPlayerEvents(session);
     return session;
