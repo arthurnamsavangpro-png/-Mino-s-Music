@@ -1,5 +1,15 @@
-// Ajoute en haut de index.js avec les imports discord.js :
+// index.js
+require("dotenv").config();
+
+// (Optionnel mais recommandé Railway) : préfère IPv4
+const dns = require("node:dns");
+dns.setDefaultResultOrder("ipv4first");
+
 const {
+  Client,
+  GatewayIntentBits,
+  REST,
+  Routes,
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
@@ -7,23 +17,90 @@ const {
   EmbedBuilder,
 } = require("discord.js");
 
+const { Shoukaku, Connectors } = require("shoukaku");
+const { commands } = require("./src/commands");
+const { MusicManager } = require("./src/music/MusicManager");
+
 const {
   buildFiltersSelectMenu,
   buildQueueEmbed,
   buildQueuePagerComponents,
 } = require("./src/ui/playerUI");
 
-// ... garde le reste de ton index.js identique, puis remplace le listener :
+const {
+  DISCORD_TOKEN,
+  CLIENT_ID,
+  GUILD_ID,
+  LAVALINK_HOST,
+  LAVALINK_PORT,
+  LAVALINK_PASSWORD,
+  LAVALINK_SECURE,
+} = process.env;
+
+if (!DISCORD_TOKEN || !CLIENT_ID) {
+  console.error("❌ DISCORD_TOKEN et CLIENT_ID sont requis.");
+  process.exit(1);
+}
+if (!LAVALINK_HOST || !LAVALINK_PASSWORD) {
+  console.error("❌ LAVALINK_HOST et LAVALINK_PASSWORD sont requis.");
+  process.exit(1);
+}
+
+// ✅ IMPORTANT : client est défini AVANT tous les client.on(...)
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
+});
+
+async function registerSlashCommands() {
+  const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
+
+  if (GUILD_ID) {
+    await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
+    console.log(`✅ Slash commands enregistrées (GUILD ${GUILD_ID}).`);
+  } else {
+    await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
+    console.log("✅ Slash commands enregistrées (GLOBAL).");
+  }
+}
+
+const nodes = [
+  {
+    name: "railway",
+    url: `${LAVALINK_HOST}:${LAVALINK_PORT || 2333}`,
+    auth: LAVALINK_PASSWORD,
+    secure: String(LAVALINK_SECURE).toLowerCase() === "true",
+  },
+];
+
+const shoukaku = new Shoukaku(new Connectors.DiscordJS(client), nodes, {
+  resume: true,
+  resumeTimeout: 60,
+  reconnectTries: 5,
+  reconnectInterval: 10,
+  restTimeout: 60,
+});
+
+shoukaku.on("ready", (name) => console.log(`🔊 Lavalink node ready: ${name}`));
+shoukaku.on("error", (name, error) => console.error(`❌ Lavalink error (${name})`, error));
+shoukaku.on("close", (name, code, reason) => console.warn(`⚠️ Lavalink close (${name})`, code, reason));
+
+// Music manager
+client.music = new MusicManager({ client, shoukaku });
+
 function inSameVoice(interaction) {
   const guild = interaction.guild;
   const me = guild?.members?.me;
   const memberVoice = interaction.member?.voice?.channelId;
   const botVoice = me?.voice?.channelId;
 
-  if (!botVoice) return Boolean(memberVoice); // si bot pas connecté, l'user doit au moins être en vocal (pour play/add)
+  // Si bot pas connecté : l'user doit au moins être en vocal (pour play/add)
+  if (!botVoice) return Boolean(memberVoice);
+
+  // Sinon : même vocal
   return memberVoice && memberVoice === botVoice;
 }
 
+// ✅ Ton interactionCreate doit être APRES la création de client
 client.on("interactionCreate", async (interaction) => {
   try {
     // ===== MODAL SUBMIT (Add track) =====
@@ -50,7 +127,6 @@ client.on("interactionCreate", async (interaction) => {
 
       const preset = interaction.values?.[0] || "none";
       await interaction.deferUpdate();
-
       await client.music.setFilterPreset(interaction.guildId, preset);
       return;
     }
@@ -60,10 +136,14 @@ client.on("interactionCreate", async (interaction) => {
       const guildId = interaction.guildId;
       if (!guildId) return interaction.reply({ content: "Serveur requis.", ephemeral: true });
 
-      const [_, action, extra] = interaction.customId.split(":");
+      // Format: music:action  OU music:queuePage:2
+      const parts = interaction.customId.split(":");
+      const action = parts[1];
+      const extra = parts[2];
+
       const session = client.music.getSession(guildId);
 
-      // Actions info (peuvent répondre ephemeral sans deferUpdate)
+      // UI ephemeral
       if (action === "queue") {
         const s = client.music.getSession(guildId);
         const { embed, page, totalPages } = buildQueueEmbed(s, 1, 10);
@@ -94,6 +174,7 @@ client.on("interactionCreate", async (interaction) => {
           .setColor(0x1db954)
           .setTitle("🎚️ Filters — Dark Luxe")
           .setDescription("Choisis un preset. (Tu dois être dans le même vocal que le bot.)");
+
         return interaction.reply({
           embeds: [embed],
           components: [buildFiltersSelectMenu(preset)],
@@ -118,12 +199,11 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.showModal(modal);
       }
 
-      // Actions “control” => require same voice
+      // Controls require same voice
       if (!inSameVoice(interaction)) {
         return interaction.reply({ content: "❌ Rejoins mon salon vocal pour contrôler la musique.", ephemeral: true });
       }
 
-      // Pour éviter “This interaction failed”
       await interaction.deferUpdate();
 
       if (action === "toggle") return client.music.toggle(guildId);
@@ -174,7 +254,6 @@ client.on("interactionCreate", async (interaction) => {
       return interaction.editReply(msg);
     }
 
-    // pour les autres, il faut être dans le même vocal
     if (!inSameVoice(interaction)) {
       return interaction.editReply("❌ Rejoins mon salon vocal pour contrôler la musique.");
     }
@@ -234,3 +313,13 @@ client.on("interactionCreate", async (interaction) => {
     }
   }
 });
+
+client.once("ready", async () => {
+  console.log(`✅ Connecté en tant que ${client.user.tag}`);
+  await registerSlashCommands().catch((e) => console.error("registerSlashCommands:", e));
+});
+
+process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e));
+process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
+
+client.login(DISCORD_TOKEN);
