@@ -6,6 +6,13 @@ function isUrl(str) {
   return /^https?:\/\//i.test(str);
 }
 
+function shuffleArray(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+}
+
 class MusicManager {
   constructor({ client, shoukaku }) {
     this.client = client;
@@ -45,19 +52,24 @@ class MusicManager {
       player,
       queue: [],
       current: null,
+      history: [],
       loop: "off", // off | track | queue
-      volume: 100, // 0-100
+      volume: 100, // Global volume 0-1000 (100 = normal)
+      filters: {
+        preset: "none",
+      },
       controller: {
         channelId: interaction.channelId,
         messageId: null,
       },
       idleTimer: null,
+      refreshTimer: null,
     };
 
     this.sessions.set(guild.id, session);
 
-    // Shoukaku global volume is 0-1000
     await player.setGlobalVolume(session.volume);
+    await player.clearFilters().catch(() => {}); // safe
 
     this.bindPlayerEvents(session);
     return session;
@@ -66,7 +78,22 @@ class MusicManager {
   bindPlayerEvents(session) {
     const player = session.player;
 
+    // auto refresh du panel (15s) pendant lecture
+    const startAutoRefresh = () => {
+      if (session.refreshTimer) clearInterval(session.refreshTimer);
+      session.refreshTimer = setInterval(() => {
+        this.renderController(session.guildId).catch(() => {});
+      }, 15000);
+      session.refreshTimer.unref?.();
+    };
+
+    const stopAutoRefresh = () => {
+      if (session.refreshTimer) clearInterval(session.refreshTimer);
+      session.refreshTimer = null;
+    };
+
     player.on("start", async () => {
+      startAutoRefresh();
       await this.renderController(session.guildId).catch(() => {});
     });
 
@@ -74,17 +101,19 @@ class MusicManager {
       if (!this.sessions.has(session.guildId)) return;
 
       const reason = data?.reason;
-      // replaced: quand on change de track volontairement
       if (reason === "replaced") return;
 
+      stopAutoRefresh();
       await this.playNext(session.guildId, { ended: true }).catch(() => {});
     });
 
     player.on("exception", async () => {
+      stopAutoRefresh();
       await this.playNext(session.guildId, { ended: true }).catch(() => {});
     });
 
     player.on("stuck", async () => {
+      stopAutoRefresh();
       await this.playNext(session.guildId, { ended: true }).catch(() => {});
     });
   }
@@ -129,6 +158,9 @@ class MusicManager {
   async play(interaction, query, source) {
     const session = await this.ensureSession(interaction);
 
+    // place le panel dans le channel où la commande est faite
+    session.controller.channelId = interaction.channelId;
+
     const resolved = await this.resolveTrack(session, query, source);
     if (!resolved.tracks.length) {
       throw new Error("Aucun résultat. Essaie une autre recherche ou une URL directe.");
@@ -136,7 +168,6 @@ class MusicManager {
 
     const requesterId = interaction.user.id;
 
-    // Tracks Lavalink v4: { encoded, info }
     const toAdd = resolved.tracks
       .map((t) => ({
         encoded: t.encoded,
@@ -146,7 +177,7 @@ class MusicManager {
       .filter((t) => t.encoded);
 
     if (!toAdd.length) {
-      throw new Error("Résultat invalide (aucun track encodé). Essaie une autre recherche.");
+      throw new Error("Résultat invalide (aucun track encodé).");
     }
 
     session.queue.push(...toAdd);
@@ -170,9 +201,13 @@ class MusicManager {
     const session = this.sessions.get(guildId);
     if (!session) return;
 
-    // Boucle : si un titre vient de finir
     const finished = session.current;
+
     if (ended && finished) {
+      // garde historique pour "previous"
+      session.history.push(finished);
+
+      // boucle
       if (session.loop === "track") {
         session.queue.unshift(finished);
       } else if (session.loop === "queue") {
@@ -184,13 +219,13 @@ class MusicManager {
     session.current = next;
 
     if (!next) {
-      // plus rien à jouer : idle + leave après 2 minutes
       await this.renderController(guildId);
 
       if (session.idleTimer) clearTimeout(session.idleTimer);
       session.idleTimer = setTimeout(() => {
         this.destroy(guildId).catch(() => {});
       }, 2 * 60 * 1000);
+      session.idleTimer.unref?.();
 
       return;
     }
@@ -201,6 +236,21 @@ class MusicManager {
     }
 
     await session.player.playTrack({ track: { encoded: next.encoded } });
+    await this.renderController(guildId);
+  }
+
+  async previous(guildId) {
+    const session = this.sessions.get(guildId);
+    if (!session?.player || !session.current) throw new Error("Aucun titre en cours.");
+
+    const prev = session.history.pop();
+    if (!prev) throw new Error("Aucun titre précédent.");
+
+    // remet le current en tête de queue pour pouvoir revenir
+    session.queue.unshift(session.current);
+    session.current = prev;
+
+    await session.player.playTrack({ track: { encoded: prev.encoded } });
     await this.renderController(guildId);
   }
 
@@ -218,11 +268,17 @@ class MusicManager {
     await this.renderController(guildId);
   }
 
+  async toggle(guildId) {
+    const session = this.sessions.get(guildId);
+    if (!session?.player) throw new Error("Aucun player actif.");
+    await session.player.setPaused(!session.player.paused);
+    await this.renderController(guildId);
+  }
+
   async skip(guildId) {
     const session = this.sessions.get(guildId);
     if (!session?.player) throw new Error("Rien à skip.");
     await session.player.stopTrack();
-    // l'event end() enchaîne sur playNext()
   }
 
   async stop(guildId) {
@@ -243,9 +299,22 @@ class MusicManager {
     const session = this.sessions.get(guildId);
     if (!session?.player) throw new Error("Aucun player actif.");
 
-    session.volume = Math.max(0, Math.min(100, volume));
+    // global volume Shoukaku: 0-1000 (100 = normal). On reste safe.
+    session.volume = Math.max(0, Math.min(200, volume));
     await session.player.setGlobalVolume(session.volume);
     await this.renderController(guildId);
+  }
+
+  async volumeUp(guildId, step = 10) {
+    const session = this.sessions.get(guildId);
+    if (!session) return;
+    await this.setVolume(guildId, Math.min(200, session.volume + step));
+  }
+
+  async volumeDown(guildId, step = 10) {
+    const session = this.sessions.get(guildId);
+    if (!session) return;
+    await this.setVolume(guildId, Math.max(0, session.volume - step));
   }
 
   cycleLoop(guildId) {
@@ -255,13 +324,88 @@ class MusicManager {
     return session.loop;
   }
 
+  shuffle(guildId) {
+    const session = this.sessions.get(guildId);
+    if (!session) return;
+    shuffleArray(session.queue);
+  }
+
+  clearQueue(guildId) {
+    const session = this.sessions.get(guildId);
+    if (!session) return;
+    session.queue = [];
+  }
+
+  async seekRelative(guildId, deltaMs) {
+    const session = this.sessions.get(guildId);
+    if (!session?.player || !session.current?.info?.length) throw new Error("Seek indisponible (LIVE).");
+
+    const duration = session.current.info.length;
+    const nextPos = Math.max(0, Math.min(duration - 1000, (session.player.position ?? 0) + deltaMs));
+    await session.player.seekTo(nextPos);
+    await this.renderController(guildId);
+  }
+
+  async setFilterPreset(guildId, preset) {
+    const session = this.sessions.get(guildId);
+    if (!session?.player) throw new Error("Aucun player actif.");
+
+    session.filters.preset = preset || "none";
+
+    // presets “propres” (évite distorsion)
+    if (!preset || preset === "none") {
+      await session.player.clearFilters();
+      await this.renderController(guildId);
+      return;
+    }
+
+    if (preset === "bassboost") {
+      // boost bas fréquences léger
+      const eq = [
+        { band: 0, gain: 0.15 },
+        { band: 1, gain: 0.12 },
+        { band: 2, gain: 0.08 },
+      ];
+      await session.player.setFilters({ equalizer: eq });
+    }
+
+    if (preset === "nightcore") {
+      await session.player.setFilters({
+        timescale: { speed: 1.12, pitch: 1.1, rate: 1.0 },
+      });
+    }
+
+    if (preset === "8d") {
+      await session.player.setFilters({
+        rotation: { rotationHz: 0.2 },
+      });
+    }
+
+    if (preset === "vaporwave") {
+      const eq = [
+        { band: 0, gain: 0.08 },
+        { band: 1, gain: 0.06 },
+        { band: 2, gain: 0.03 },
+        { band: 10, gain: 0.06 },
+        { band: 11, gain: 0.08 },
+        { band: 12, gain: 0.09 },
+      ];
+      await session.player.setFilters({
+        timescale: { speed: 0.88, pitch: 0.9, rate: 1.0 },
+        equalizer: eq,
+      });
+    }
+
+    await this.renderController(guildId);
+  }
+
   buildQueueEmbed(guildId) {
     const session = this.sessions.get(guildId);
     if (!session) {
-      return new EmbedBuilder().setColor(0x9b59b6).setDescription("Aucune file active.");
+      return new EmbedBuilder().setColor(0x1db954).setDescription("Aucune file active.");
     }
 
-    const embed = new EmbedBuilder().setColor(0x9b59b6).setTitle("📜 Queue");
+    const embed = new EmbedBuilder().setColor(0x1db954).setTitle("📜 Queue");
     const lines = [];
 
     if (session.current?.info) {
@@ -293,7 +437,6 @@ class MusicManager {
     const embed = buildPlayerEmbed(session);
     const components = buildPlayerComponents(session);
 
-    // créer ou éditer le panel
     if (!session.controller.messageId) {
       const msg = await channel.send({ embeds: [embed], components });
       session.controller.messageId = msg.id;
@@ -316,6 +459,7 @@ class MusicManager {
     if (!session) return;
 
     if (session.idleTimer) clearTimeout(session.idleTimer);
+    if (session.refreshTimer) clearInterval(session.refreshTimer);
 
     try {
       await this.shoukaku.leaveVoiceChannel(guildId);
