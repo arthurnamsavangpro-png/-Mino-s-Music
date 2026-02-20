@@ -1,5 +1,12 @@
 {
+  "name": "[+] Mino's Music",
+  "version": "1.0.0",
+  "type": "commonjs",
+  "main": "index.js",
   "scripts": {
     "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
