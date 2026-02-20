@@ -1,116 +1,216 @@
-// index.js
 require("dotenv").config();
 
+const { Client, GatewayIntentBits, REST, Routes, PermissionFlagsBits } = require("discord.js");
+const { Shoukaku, Connectors } = require("shoukaku");
+const { commands } = require("./src/commands");
+const { MusicManager } = require("./src/music/MusicManager");
+
 const {
-  Client,
-  GatewayIntentBits,
-  REST,
-  Routes,
-  SlashCommandBuilder,
-  EmbedBuilder,
-  ActionRowBuilder,
-  ButtonBuilder,
-  ButtonStyle,
-} = require("discord.js");
+  DISCORD_TOKEN,
+  CLIENT_ID,
+  GUILD_ID,
+  LAVALINK_HOST,
+  LAVALINK_PORT,
+  LAVALINK_PASSWORD,
+  LAVALINK_SECURE,
+} = process.env;
 
-const TOKEN = process.env.DISCORD_TOKEN;
-const CLIENT_ID = process.env.CLIENT_ID;
-// Si tu mets GUILD_ID, les commandes apparaissent instantanément sur ton serveur de test :
-const GUILD_ID = process.env.GUILD_ID;
-
-if (!TOKEN) {
-  console.error("❌ DISCORD_TOKEN manquant (Railway > Variables).");
+if (!DISCORD_TOKEN || !CLIENT_ID) {
+  console.error("❌ DISCORD_TOKEN et CLIENT_ID sont requis.");
   process.exit(1);
 }
-if (!CLIENT_ID) {
-  console.error("❌ CLIENT_ID manquant (Railway > Variables).");
+if (!LAVALINK_HOST || !LAVALINK_PASSWORD) {
+  console.error("❌ LAVALINK_HOST et LAVALINK_PASSWORD sont requis.");
   process.exit(1);
 }
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
 });
 
-/** Slash commands */
-const commands = [
-  new SlashCommandBuilder().setName("ping").setDescription("Voir la latence du bot"),
-  new SlashCommandBuilder().setName("help").setDescription("Afficher l'aide du bot"),
-].map((c) => c.toJSON());
+async function registerSlashCommands() {
+  const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
 
-async function registerCommands() {
-  const rest = new REST({ version: "10" }).setToken(TOKEN);
-
-  try {
-    if (GUILD_ID) {
-      await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), {
-        body: commands,
-      });
-      console.log("✅ Commandes enregistrées (GUILD) !");
-    } else {
-      await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
-      console.log("✅ Commandes enregistrées (GLOBAL) !");
-    }
-  } catch (err) {
-    console.error("❌ Erreur enregistrement commandes:", err);
+  if (GUILD_ID) {
+    await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
+    console.log(`✅ Slash commands enregistrées (GUILD ${GUILD_ID}).`);
+  } else {
+    await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
+    console.log("✅ Slash commands enregistrées (GLOBAL).");
   }
 }
 
-function prettyUptime(ms) {
-  const s = Math.floor(ms / 1000);
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const sec = s % 60;
-  return `${h}h ${m}m ${sec}s`;
-}
+const nodes = [
+  {
+    name: "railway",
+    url: `${LAVALINK_HOST}:${LAVALINK_PORT || 2333}`,
+    auth: LAVALINK_PASSWORD,
+    secure: String(LAVALINK_SECURE).toLowerCase() === "true",
+  },
+];
 
-client.once("ready", () => {
-  console.log(`🤖 Connecté en tant que ${client.user.tag}`);
+const shoukaku = new Shoukaku(new Connectors.DiscordJS(client), nodes, {
+  resume: true,
+  resumeTimeout: 60,
+  reconnectTries: 5,
+  reconnectInterval: 10,
+  restTimeout: 60,
 });
+
+shoukaku.on("ready", (name) => console.log(`🔊 Lavalink node ready: ${name}`));
+shoukaku.on("error", (name, error) => console.error(`❌ Lavalink error (${name})`, error));
+shoukaku.on("close", (name, code, reason) => console.warn(`⚠️ Lavalink close (${name})`, code, reason));
+
+client.music = new MusicManager({ client, shoukaku });
+
+function mustBeInSameVoice(interaction) {
+  const guild = interaction.guild;
+  const me = guild?.members?.me;
+  const memberVoice = interaction.member?.voice?.channelId;
+  const botVoice = me?.voice?.channelId;
+
+  if (!botVoice) return true; // bot pas connecté
+  return memberVoice && memberVoice === botVoice;
+}
 
 client.on("interactionCreate", async (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
+  try {
+    // Boutons UI
+    if (interaction.isButton() && interaction.customId.startsWith("music:")) {
+      const action = interaction.customId.split(":")[1];
+      const guildId = interaction.guildId;
 
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setLabel("GitHub")
-      .setStyle(ButtonStyle.Link)
-      .setURL("https://github.com/arthurnamsavangpro-png/-Mino-s-Music")
-  );
+      if (!guildId) return interaction.reply({ content: "Serveur requis.", ephemeral: true });
+      if (!mustBeInSameVoice(interaction)) {
+        return interaction.reply({ content: "❌ Rejoins mon salon vocal pour contrôler la musique.", ephemeral: true });
+      }
 
-  if (interaction.commandName === "ping") {
-    const embed = new EmbedBuilder()
-      .setTitle("🏓 Pong !")
-      .setDescription("Latence & état du bot")
-      .addFields(
-        { name: "📡 WebSocket", value: `\`${client.ws.ping}ms\``, inline: true },
-        { name: "⏱️ Uptime", value: `\`${prettyUptime(client.uptime)}\``, inline: true },
-        { name: "🧠 Node", value: `\`${process.version}\``, inline: true }
-      )
-      .setFooter({ text: "Mino's Music • Railway" })
-      .setTimestamp();
+      // on évite “This interaction failed”
+      await interaction.deferUpdate();
 
-    return interaction.reply({ embeds: [embed], components: [row], ephemeral: false });
-  }
+      if (action === "toggle") {
+        const s = client.music.getSession(guildId);
+        if (!s?.player) return;
+        await s.player.setPaused(!s.player.paused);
+        await client.music.renderController(guildId);
+      }
 
-  if (interaction.commandName === "help") {
-    const embed = new EmbedBuilder()
-      .setTitle("✨ Aide du bot")
-      .setDescription("Commandes disponibles :")
-      .addFields(
-        { name: "/ping", value: "Affiche la latence et l'uptime", inline: false },
-        { name: "/help", value: "Affiche ce menu d'aide", inline: false }
-      )
-      .setFooter({ text: "Prochaine étape : ajouter musique (Lavalink ou ytdl)" })
-      .setTimestamp();
+      if (action === "skip") await client.music.skip(guildId);
+      if (action === "stop") await client.music.stop(guildId);
 
-    return interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
+      if (action === "loop") {
+        client.music.cycleLoop(guildId);
+        await client.music.renderController(guildId);
+      }
+
+      if (action === "voldown") {
+        const s = client.music.getSession(guildId);
+        if (!s) return;
+        await client.music.setVolume(guildId, Math.max(0, s.volume - 10));
+      }
+
+      if (action === "volup") {
+        const s = client.music.getSession(guildId);
+        if (!s) return;
+        await client.music.setVolume(guildId, Math.min(100, s.volume + 10));
+      }
+
+      if (action === "queue") {
+        const embed = client.music.buildQueueEmbed(guildId);
+        await interaction.followUp({ embeds: [embed], ephemeral: true }).catch(() => {});
+      }
+
+      if (action === "refresh") {
+        await client.music.renderController(guildId);
+      }
+
+      return;
+    }
+
+    // Slash commands
+    if (!interaction.isChatInputCommand()) return;
+
+    const guildId = interaction.guildId;
+    const name = interaction.commandName;
+
+    if (!guildId) return interaction.reply({ content: "Serveur requis.", ephemeral: true });
+
+    // réponses discrètes, UI publique via panel
+    await interaction.deferReply({ ephemeral: true });
+
+    if (name === "play") {
+      const query = interaction.options.getString("query", true);
+      const source = interaction.options.getString("source") || "ytsearch";
+      const msg = await client.music.play(interaction, query, source);
+      return interaction.editReply(msg);
+    }
+
+    if (!mustBeInSameVoice(interaction)) {
+      return interaction.editReply("❌ Rejoins mon salon vocal pour contrôler la musique.");
+    }
+
+    if (name === "pause") {
+      await client.music.pause(guildId);
+      return interaction.editReply("⏸️ Pause.");
+    }
+
+    if (name === "resume") {
+      await client.music.resume(guildId);
+      return interaction.editReply("▶️ Reprise.");
+    }
+
+    if (name === "skip") {
+      await client.music.skip(guildId);
+      return interaction.editReply("⏭️ Skip.");
+    }
+
+    if (name === "stop") {
+      await client.music.stop(guildId);
+      return interaction.editReply("⏹️ Stop + leave.");
+    }
+
+    if (name === "volume") {
+      const v = interaction.options.getInteger("value", true);
+      await client.music.setVolume(guildId, v);
+      return interaction.editReply(`🔊 Volume: ${v}%`);
+    }
+
+    if (name === "loop") {
+      const mode = interaction.options.getString("mode", true);
+      const session = client.music.getSession(guildId);
+      if (!session) return interaction.editReply("Aucun player actif.");
+      session.loop = mode;
+      await client.music.renderController(guildId);
+      return interaction.editReply(`🔁 Loop: ${mode}`);
+    }
+
+    if (name === "queue") {
+      const embed = client.music.buildQueueEmbed(guildId);
+      return interaction.editReply({ embeds: [embed] });
+    }
+
+    if (name === "now") {
+      const session = client.music.getSession(guildId);
+      if (!session?.current) return interaction.editReply("Aucun titre en cours.");
+      const t = session.current.info;
+      return interaction.editReply(`🎶 Now: **${t?.title || "Titre"}**`);
+    }
+  } catch (err) {
+    const msg = `❌ ${err?.message || "Erreur inconnue."}`;
+    if (interaction.deferred || interaction.replied) {
+      await interaction.editReply(msg).catch(() => {});
+    } else {
+      await interaction.reply({ content: msg, ephemeral: true }).catch(() => {});
+    }
   }
 });
 
-process.on("unhandledRejection", (err) => console.error("unhandledRejection:", err));
-process.on("uncaughtException", (err) => console.error("uncaughtException:", err));
+client.once("ready", async () => {
+  console.log(`✅ Connecté en tant que ${client.user.tag}`);
+  await registerSlashCommands();
+});
 
-(async () => {
-  await registerCommands();
-  await client.login(TOKEN);
-})();
+process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e));
+process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
+
+client.login(DISCORD_TOKEN);
