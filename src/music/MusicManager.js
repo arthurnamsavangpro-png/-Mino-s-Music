@@ -46,7 +46,7 @@ class MusicManager {
       queue: [],
       current: null,
       loop: "off", // off | track | queue
-      volume: 80, // 0-100
+      volume: 100, // 0-100
       controller: {
         channelId: interaction.channelId,
         messageId: null,
