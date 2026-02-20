@@ -1,3 +1,4 @@
+// src/music/MusicManager.js
 const { EmbedBuilder } = require("discord.js");
 const { buildPlayerEmbed, buildPlayerComponents, formatMs } = require("../ui/playerUI");
 
@@ -44,8 +45,8 @@ class MusicManager {
       player,
       queue: [],
       current: null,
-      loop: "off",     // off | track | queue
-      volume: 80,      // 0-100
+      loop: "off", // off | track | queue
+      volume: 80, // 0-100
       controller: {
         channelId: interaction.channelId,
         messageId: null,
@@ -55,7 +56,8 @@ class MusicManager {
 
     this.sessions.set(guild.id, session);
 
-    await player.setGlobalVolume(session.volume * 10); // global volume = 0-1000
+    // Shoukaku global volume is 0-1000
+    await player.setGlobalVolume(session.volume * 10);
 
     this.bindPlayerEvents(session);
     return session;
@@ -69,11 +71,11 @@ class MusicManager {
     });
 
     player.on("end", async (data) => {
-      // data.reason: finished | stopped | replaced | loadFailed | cleanup ...
       if (!this.sessions.has(session.guildId)) return;
 
       const reason = data?.reason;
-      if (reason === "replaced") return; // on ignore, c’est un changement forcé
+      // replaced: quand on change de track volontairement
+      if (reason === "replaced") return;
 
       await this.playNext(session.guildId, { ended: true }).catch(() => {});
     });
@@ -87,15 +89,41 @@ class MusicManager {
     });
   }
 
+  /**
+   * Resolve tracks compatible Lavalink v4 (loadType + data) and v3 (tracks).
+   */
   async resolveTrack(session, query, source) {
     const q = isUrl(query) ? query : `${source || "ytsearch"}:${query}`;
+
     const result = await session.player.node.rest.resolve(q);
+    const loadType = result?.loadType || "EMPTY";
 
-    const tracks = result?.tracks || [];
-    if (!tracks.length) return { type: "EMPTY", tracks: [] };
+    let tracks = [];
+    let playlistInfo = null;
 
-    const loadType = result?.loadType || "TRACK_LOADED";
-    return { type: loadType, tracks, playlistInfo: result?.playlistInfo || null };
+    // Lavalink v3 => { tracks: [], playlistInfo: {} }
+    if (Array.isArray(result?.tracks)) {
+      tracks = result.tracks;
+      playlistInfo = result.playlistInfo ?? null;
+      return { type: loadType, tracks, playlistInfo };
+    }
+
+    // Lavalink v4 => { loadType, data }
+    const lt = String(loadType).toLowerCase();
+    const data = result?.data;
+
+    if (lt === "track" && data) {
+      tracks = [data];
+    } else if (lt === "playlist" && data) {
+      tracks = Array.isArray(data.tracks) ? data.tracks : [];
+      playlistInfo = data.info ?? null;
+    } else if (lt === "search" && Array.isArray(data)) {
+      tracks = data;
+    } else {
+      tracks = [];
+    }
+
+    return { type: loadType, tracks, playlistInfo };
   }
 
   async play(interaction, query, source) {
@@ -108,16 +136,22 @@ class MusicManager {
 
     const requesterId = interaction.user.id;
 
-    // playlist ou liste
-    const toAdd = resolved.tracks.map((t) => ({
-      encoded: t.encoded,
-      info: t.info,
-      requesterId,
-    }));
+    // Tracks Lavalink v4: { encoded, info }
+    const toAdd = resolved.tracks
+      .map((t) => ({
+        encoded: t.encoded,
+        info: t.info,
+        requesterId,
+      }))
+      .filter((t) => t.encoded);
+
+    if (!toAdd.length) {
+      throw new Error("Résultat invalide (aucun track encodé). Essaie une autre recherche.");
+    }
 
     session.queue.push(...toAdd);
 
-    // Si rien ne joue, on démarre
+    // Démarrer si rien ne joue
     if (!session.current && !session.player.track) {
       await this.playNext(session.guildId, { ended: false });
     } else {
@@ -136,7 +170,7 @@ class MusicManager {
     const session = this.sessions.get(guildId);
     if (!session) return;
 
-    // boucle: si un titre vient de finir et on avait current
+    // Boucle : si un titre vient de finir
     const finished = session.current;
     if (ended && finished) {
       if (session.loop === "track") {
@@ -150,13 +184,13 @@ class MusicManager {
     session.current = next;
 
     if (!next) {
-      // plus rien à jouer → idle + leave après 2 minutes
+      // plus rien à jouer : idle + leave après 2 minutes
       await this.renderController(guildId);
 
       if (session.idleTimer) clearTimeout(session.idleTimer);
       session.idleTimer = setTimeout(() => {
         this.destroy(guildId).catch(() => {});
-      }, 2 * 60 * 1000).unref?.();
+      }, 2 * 60 * 1000);
 
       return;
     }
@@ -188,23 +222,27 @@ class MusicManager {
     const session = this.sessions.get(guildId);
     if (!session?.player) throw new Error("Rien à skip.");
     await session.player.stopTrack();
-    // le "end" event enchaîne tout seul sur playNext()
+    // l'event end() enchaîne sur playNext()
   }
 
   async stop(guildId) {
     const session = this.sessions.get(guildId);
     if (!session) return;
+
     session.queue = [];
     session.current = null;
+
     try {
       await session.player.stopTrack();
     } catch {}
+
     await this.destroy(guildId);
   }
 
   async setVolume(guildId, volume) {
     const session = this.sessions.get(guildId);
     if (!session?.player) throw new Error("Aucun player actif.");
+
     session.volume = Math.max(0, Math.min(100, volume));
     await session.player.setGlobalVolume(session.volume * 10);
     await this.renderController(guildId);
@@ -227,7 +265,9 @@ class MusicManager {
     const lines = [];
 
     if (session.current?.info) {
-      lines.push(`**Now:** ${session.current.info.title || "Titre"} \`(${formatMs(session.current.info.length)})\``);
+      lines.push(
+        `**Now:** ${session.current.info.title || "Titre"} \`(${formatMs(session.current.info.length)})\``
+      );
     }
 
     if (!session.queue.length) {
@@ -253,7 +293,7 @@ class MusicManager {
     const embed = buildPlayerEmbed(session);
     const components = buildPlayerComponents(session);
 
-    // créer ou éditer
+    // créer ou éditer le panel
     if (!session.controller.messageId) {
       const msg = await channel.send({ embeds: [embed], components });
       session.controller.messageId = msg.id;
